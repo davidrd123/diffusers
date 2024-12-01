@@ -2653,6 +2653,7 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        # Save LoRA weights
         transformer = unwrap_model(transformer)
         transformer = transformer.to(weight_dtype)
         transformer_lora_layers = get_peft_model_state_dict(transformer)
@@ -2674,31 +2675,42 @@ def main(args):
             embeddings_path = f"{args.output_dir}/{os.path.basename(args.output_dir)}_emb.safetensors"
             embedding_handler.save_embeddings(embeddings_path)
 
-        # Final inference
-        # Load previous pipeline
-        pipeline = FluxPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
-        if not pure_textual_inversion:
-            # load attention processors
-            pipeline.load_lora_weights(args.output_dir)
+        # Clear memory before final inference
+        del transformer_lora_layers, text_encoder_lora_layers
+        free_memory()
 
-        # run inference
+        # Final inference with memory management
         images = []
         if args.validation_prompt and args.num_validation_images > 0:
-            pipeline_args = {"prompt": args.validation_prompt}
-            images = log_validation(
-                pipeline=pipeline,
-                args=args,
-                accelerator=accelerator,
-                pipeline_args=pipeline_args,
-                epoch=epoch,
+            # Load pipeline components gradually
+            pipeline = FluxPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                revision=args.revision,
+                variant=args.variant,
                 torch_dtype=weight_dtype,
-                is_final_validation=True,
+                device_map="auto",  # Enable component offloading
+                low_cpu_mem_usage=True
             )
+            
+            if not pure_textual_inversion:
+                pipeline.load_lora_weights(args.output_dir)
+
+            # Run validation
+            pipeline_args = {"prompt": args.validation_prompt}
+            try:
+                images = log_validation(
+                    pipeline=pipeline,
+                    args=args,
+                    accelerator=accelerator,
+                    pipeline_args=pipeline_args,
+                    epoch=epoch,
+                    torch_dtype=weight_dtype,
+                    is_final_validation=True,
+                )
+            finally:
+                # Ensure cleanup happens even if validation fails
+                del pipeline
+                free_memory()
 
         save_model_card(
             model_id if not args.push_to_hub else repo_id,
