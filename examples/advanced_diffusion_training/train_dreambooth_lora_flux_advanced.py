@@ -234,7 +234,7 @@ def log_validation(
         images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
 
     for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
+        phase_name = "test" if is_final_validation else "validation"  
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
@@ -749,6 +749,25 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention",
+        action="store_true",
+        default=False,
+        help="Enable memory efficient attention",
+    )
+    parser.add_argument(
+        "--enable_attention_slicing",
+        action="store_true",
+        default=False,
+        help="Enable attention slicing",
+    )
+    parser.add_argument(
+        "--enable_cpu_offload",
+        action="store_true",
+        default=False,
+        help="Enable automatic CPU offloading for models that don't fit in GPU memory",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1483,40 +1502,83 @@ def main(args):
             ).repo_id
 
     # Load the tokenizers
+    logger.info("Loading tokenizers...")
     tokenizer_one = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
         revision=args.revision,
     )
+    logger.info("Loaded CLIP tokenizer")
+    free_memory()
+
     tokenizer_two = T5TokenizerFast.from_pretrained(
         args.pretrained_model_name_or_path,
-        subfolder="tokenizer_2",
+        subfolder="tokenizer_2", 
         revision=args.revision,
     )
-
+    logger.info("Loaded T5 tokenizer")
+    free_memory()
     # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-    )
+    logger.info("Loading text encoders...")
+    try:
+        text_encoder_cls_one = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision
+        )
+        text_encoder_cls_two = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+        )
+        logger.info("Imported text encoder classes")
+        free_memory()
+        # Load text encoders directly instead of using load_text_encoders helper
+        text_encoder_one = text_encoder_cls_one.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            device_map="auto" if args.enable_cpu_offload else None,
+            variant=args.variant,
+        )
+        logger.info("Loaded text encoder one")
+        
+        text_encoder_two = text_encoder_cls_two.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder_2",
+            revision=args.revision,
+            variant=args.variant,
+            device_map="auto" if args.enable_cpu_offload else None,
+        )
+        logger.info("Loaded text encoder two")
+        
+    except Exception as e:
+        logger.error(f"Failed to load text encoders: {str(e)}")
+        logger.error(f"Full error: {e.__class__.__name__}: {str(e)}")
+        raise
 
     # Load scheduler and models
     noise_scheduler = CustomFlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
+        args.pretrained_model_name_or_path, 
+        subfolder="scheduler",
+        device_map="auto" if args.enable_cpu_offload else None,
     )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
+    free_memory()
+
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
+        device_map="auto" if args.enable_cpu_offload else None,
     )
+    free_memory()
+    
     transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, 
+        subfolder="transformer", 
+        revision=args.revision, 
+        variant=args.variant,
+        device_map="auto" if args.enable_cpu_offload else None,
+        torch_dtype=weight_dtype if args.mixed_precision != "no" else torch.float32,
     )
+    free_memory()
 
     if args.train_text_encoder_ti:
         # we parse the provided token identifier (or identifiers) into a list. s.t. - "TOK" -> ["TOK"], "TOK,
