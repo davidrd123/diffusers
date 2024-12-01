@@ -2090,42 +2090,47 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
-        if args.optimizer.lower() == "prodigy":
-            try:
-                import prodigyopt
-            except ImportError:
-                raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+    if args.optimizer.lower() == "prodigy":
+        try:
+            import prodigyopt
+        except ImportError:
+            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
 
-            optimizer_class = prodigyopt.Prodigy
+        optimizer_class = prodigyopt.Prodigy
 
-            if args.learning_rate <= 0.1:
-                logger.warning(
-                    "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
-                )
-            if not freeze_text_encoder and args.text_encoder_lr:
-                logger.warning(
-                    f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
-                    f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
-                    f"When using prodigy only learning_rate is used as the initial learning rate."
-                )
-                params_to_optimize[te_idx]["lr"] = args.learning_rate
-                params_to_optimize[-1]["lr"] = args.learning_rate
-
-            # Cast all parameters to the correct dtype before creating optimizer
-            for param_group in params_to_optimize:
-                param_group["params"] = [p.to(dtype=weight_dtype) for p in param_group["params"]]
-
-            optimizer = optimizer_class(
-                params_to_optimize,
-                betas=(args.adam_beta1, args.adam_beta2),
-                beta3=args.prodigy_beta3,
-                weight_decay=args.adam_weight_decay,
-                eps=args.adam_epsilon,
-                decouple=args.prodigy_decouple,
-                use_bias_correction=args.prodigy_use_bias_correction,
-                safeguard_warmup=args.prodigy_safeguard_warmup,
+        if args.learning_rate <= 0.1:
+            logger.warning(
+                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
             )
+        if not freeze_text_encoder and args.text_encoder_lr:
+            logger.warning(
+                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
+                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
+                f"When using prodigy only learning_rate is used as the initial learning rate."
+            )
+            params_to_optimize[te_idx]["lr"] = args.learning_rate
+            params_to_optimize[-1]["lr"] = args.learning_rate
 
+        # Cast parameters while preserving leaf status
+        for param_group in params_to_optimize:
+            params = param_group["params"]
+            param_group["params"] = []
+            for p in params:
+                p_new = p.detach().to(dtype=weight_dtype)
+                p_new.requires_grad = p.requires_grad
+                param_group["params"].append(p_new)
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            betas=(args.adam_beta1, args.adam_beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
+        )
+        
     
         
     train_dataset = DreamBoothDataset(
