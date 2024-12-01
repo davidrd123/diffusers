@@ -15,16 +15,18 @@
 
 import argparse
 import copy
+import psutil
 import itertools
 import logging
 import math
 import os
+import sys
 import random
 import re
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -68,6 +70,7 @@ from diffusers.utils import (
 )
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import is_compiled_module
+    
 
 
 if is_wandb_available():
@@ -76,8 +79,17 @@ if is_wandb_available():
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.32.0.dev0")
 
-logger = get_logger(__name__)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training.log')
+    ]
+)
 
+logger = get_logger(__name__)
 
 def save_model_card(
     repo_id: str,
@@ -200,18 +212,6 @@ Please adhere to the licensing terms as described [here](https://huggingface.co/
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
-
-
-def load_text_encoders(class_one, class_two):
-    text_encoder_one = class_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    )
-    text_encoder_two = class_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
-    )
-    return text_encoder_one, text_encoder_two
-
-
 def log_validation(
     pipeline,
     args,
@@ -225,15 +225,45 @@ def log_validation(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
         f" {args.validation_prompt}."
     )
-    pipeline = pipeline.to(accelerator.device, dtype=torch_dtype)
+    
+    # 1. Move pipeline and ensure all components use same dtype
+    pipeline = pipeline.to(accelerator.device)
+    for component in [pipeline.vae, pipeline.text_encoder, pipeline.transformer]:
+        if hasattr(component, 'to'):
+            component.to(dtype=torch_dtype)
+    
     pipeline.set_progress_bar_config(disable=True)
 
-    # run inference
+    # 2. Truncate validation prompt if needed
+    if len(pipeline.tokenizer.encode(args.validation_prompt)) > 77:
+        logger.warning("Validation prompt too long, will be truncated to 77 tokens")
+        # Let the tokenizer handle truncation
+        
+    # 3. Set up inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    autocast_ctx = nullcontext()
+    autocast_ctx = torch.autocast(device_type=accelerator.device.type, dtype=torch_dtype)
 
     with autocast_ctx:
-        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+        try:
+            images = []
+            for _ in range(args.num_validation_images):
+                # Cast all pipeline inputs to correct dtype
+                pipeline_args_typed = {
+                    k: v.to(dtype=torch_dtype) if isinstance(v, torch.Tensor) else v 
+                    for k, v in pipeline_args.items()
+                }
+                
+                # Run inference with dtype-consistent inputs
+                output = pipeline(
+                    **pipeline_args_typed,
+                    generator=generator,
+                )
+                images.append(output.images[0])
+        except Exception as e:
+            logger.error(f"Error during validation: {e}")
+            logger.error(f"Pipeline args: {pipeline_args}")
+            logger.error(f"Device: {accelerator.device}, dtype: {torch_dtype}")
+            raise
 
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"  
@@ -1030,12 +1060,54 @@ class DreamBoothDataset(Dataset):
             if not self.instance_data_root.exists():
                 raise ValueError("Instance images root doesn't exists.")
 
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-            self.custom_instance_prompts = None
+            # Find all image files with jpg/png/jpeg extensions
+            image_paths = []
+            image_paths.extend(list(self.instance_data_root.glob("*.[jJ][pP][gG]")))
+            image_paths.extend(list(self.instance_data_root.glob("*.[pP][nN][gG]")))
+            image_paths.extend(list(self.instance_data_root.glob("*.[jJ][pP][eE][gG]")))
+            
+            if not image_paths:
+                raise ValueError(f"No image files found in {self.instance_data_root}")
+            
+            # Load images and their captions
+            instance_images = []
+            instance_prompts = []  # Temporary list to store prompts
+            
+            for image_path in image_paths:
+                # For each image, find the corresponding caption file
+                caption_path = image_path.with_suffix(".txt")
+                if caption_path.exists():
+                    with open(caption_path, "r") as f:
+                        caption = f.read().strip()
+                        instance_prompts.append(caption)
+                else:
+                    # If no caption file is found, use the instance prompt as the caption
+                    instance_prompts.append(self.instance_prompt)
+                
+                # Load and validate the images
+                try:
+                    image = Image.open(image_path)
+                    if not image.mode == "RGB":
+                        image = image.convert("RGB")
+                    instance_images.append(image)
+                except Exception as e:
+                    logger.warning(f"Failed to open image {image_path}: {e}")
+                    # Remove the corresponding prompt if image loading failed
+                    instance_prompts.pop()
+                    continue
+            
+            # Set custom instance prompts only if we found any caption files
+            has_custom_captions = any(p.with_suffix(".txt").exists() for p in image_paths)
+            self.custom_instance_prompts = instance_prompts if has_custom_captions else None
 
         self.instance_images = []
-        for img in instance_images:
+        self.original_prompts = []
+        for idx, img in enumerate(instance_images):
             self.instance_images.extend(itertools.repeat(img, repeats))
+            if self.custom_instance_prompts:    
+                self.original_prompts.extend(itertools.repeat(self.custom_instance_prompts[idx], repeats))
+            else:
+                self.original_prompts.extend(itertools.repeat(self.instance_prompt, repeats))
 
         self.pixel_values = []
         train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
@@ -1094,23 +1166,23 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
+        # Get the preprocessed image tensor
         instance_image = self.pixel_values[index % self.num_instance_images]
         example["instance_images"] = instance_image
 
-        if self.custom_instance_prompts:
-            caption = self.custom_instance_prompts[index % self.num_instance_images]
-            if caption:
-                if self.train_text_encoder_ti:
-                    # replace instances of --token_abstraction in caption with the new tokens: "<si><si+1>" etc.
-                    for token_abs, token_replacement in self.token_abstraction_dict.items():
-                        caption = caption.replace(token_abs, "".join(token_replacement))
-                example["instance_prompt"] = caption
-            else:
-                example["instance_prompt"] = self.instance_prompt
+        # Get the corresponding prompt - use original_prompts instead of custom_instance_prompts
+        # since original_prompts is guaranteed to have a value for each image
+        prompt = self.original_prompts[index % self.num_instance_images]
+        
+        # Apply textual inversion token replacement if needed
+        if self.train_text_encoder_ti:
+            # replace instances of --token_abstraction in prompt with the new tokens: "<si><si+1>" etc.
+            for token_abs, token_replacement in self.token_abstraction_dict.items():
+                prompt = prompt.replace(token_abs, "".join(token_replacement))
+        
+        example["instance_prompt"] = prompt
 
-        else:  # the given instance prompt is used for all images
-            example["instance_prompt"] = self.instance_prompt
-
+        # Handle class images if using prior preservation
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             class_image = exif_transpose(class_image)
@@ -1253,6 +1325,48 @@ def _get_clip_prompt_embeds(
     return prompt_embeds
 
 
+def load_text_encoders(text_encoder_cls_one, text_encoder_cls_two):
+    """Load and prepare text encoders for inference."""
+    base_kwargs = {
+        "pretrained_model_name_or_path": args.pretrained_model_name_or_path,
+        "revision": args.revision,
+        "variant": args.variant,
+        "torch_dtype": weight_dtype if args.mixed_precision != "no" else torch.float32,
+    }
+
+    if args.enable_cpu_offload:
+        logger.info("CPU offloading enabled")
+        base_kwargs.update({
+            "device_map": "auto",
+            "low_cpu_mem_usage": True,
+        })
+
+    logger.info("Loading text encoders for inference...")
+    text_encoder_one = load_model_safely(
+        text_encoder_cls_one,
+        **base_kwargs,
+        subfolder="text_encoder",
+    )
+    logger.info("Loaded inference text encoder one")
+    free_memory()
+    print_memory_usage("after loading inference text encoder one")
+
+    text_encoder_two = load_model_safely(
+        text_encoder_cls_two,
+        **base_kwargs,
+        subfolder="text_encoder_2",
+    )
+    logger.info("Loaded inference text encoder two")
+    free_memory()
+    print_memory_usage("after loading inference text encoder two")
+
+    # Set to eval mode
+    text_encoder_one.eval()
+    text_encoder_two.eval()
+    
+    return text_encoder_one, text_encoder_two
+
+
 def encode_prompt(
     text_encoders,
     tokenizers,
@@ -1261,7 +1375,14 @@ def encode_prompt(
     device=None,
     num_images_per_prompt: int = 1,
     text_input_ids_list=None,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        tuple(torch.Tensor, torch.Tensor, torch.Tensor):
+            - prompt_embeds: shape (batch_size * num_images_per_prompt, sequence_length, hidden_size)
+            - pooled_prompt_embeds: shape (batch_size * num_images_per_prompt, hidden_size)
+            - text_ids: shape (batch_size * num_images_per_prompt, sequence_length)
+    """
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
     dtype = text_encoders[0].dtype
@@ -1393,6 +1514,50 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             return timesteps
 
 
+def print_memory_usage(stage: str):
+    """Print both system RAM and GPU memory usage"""
+    # Force flush previous logs
+    sys.stdout.flush()
+    
+    process = psutil.Process(os.getpid())
+    ram_usage = process.memory_info().rss / 1024**2  # RAM usage in MB
+    ram_percent = psutil.virtual_memory().percent
+    
+    # Print directly as well as logging
+    print(f"System RAM at {stage}: {ram_usage:.2f}MB ({ram_percent}% used)")
+    logger.info(f"System RAM at {stage}: {ram_usage:.2f}MB ({ram_percent}% used)")
+    
+    if torch.cuda.is_available():
+        gpu_allocated = torch.cuda.memory_allocated() / 1024**2
+        gpu_reserved = torch.cuda.memory_reserved() / 1024**2
+        gpu_max = torch.cuda.get_device_properties(0).total_memory / 1024**2
+        
+        gpu_msg = f"GPU Memory at {stage}: {gpu_allocated:.2f}MB allocated, {gpu_reserved:.2f}MB reserved (max: {gpu_max:.2f}MB)"
+        print(gpu_msg)
+        logger.info(gpu_msg)
+        
+    # Force flush after printing
+    sys.stdout.flush()
+
+def load_model_safely(model_cls, *args, **kwargs):
+    """Load a model with proper memory cleanup before and after"""
+    model_name = model_cls.__name__
+    free_memory()
+    print_memory_usage(f"Before loading {model_name}")
+    try:
+        logger.info(f"Starting to load {model_name}")
+        model = model_cls.from_pretrained(*args, **kwargs)
+        logger.info(f"Successfully loaded {model_name}")
+        print_memory_usage(f"After loading {model_name}")
+        return model
+    except Exception as e:
+        logger.error(f"Failed to load {model_name}: {str(e)}")
+        logger.error(f"Full error: {e.__class__.__name__}: {str(e)}")
+        print_memory_usage(f"Failed loading {model_name}")
+        raise
+    finally:
+        free_memory()
+
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -1520,84 +1685,102 @@ def main(args):
     # Then load models using the defined weight_dtype
     logger.info(f"Using {weight_dtype} precision for model loading")
 
-    # Load the tokenizers
+    # Main loading sequence
+    logger.info("Starting model loading sequence...")
+    print_memory_usage("start")
+
+    base_kwargs = {
+        "pretrained_model_name_or_path": args.pretrained_model_name_or_path,
+        "revision": args.revision,
+        "variant": args.variant,
+        "torch_dtype": weight_dtype if args.mixed_precision != "no" else torch.float32,
+    }
+
+    if args.enable_cpu_offload:
+        logger.info("CPU offloading enabled")
+        base_kwargs.update({
+            "device_map": "auto",
+            "low_cpu_mem_usage": True,
+        })
+
+    # Load tokenizers
     logger.info("Loading tokenizers...")
-    tokenizer_one = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
+    tokenizer_one = load_model_safely(
+        CLIPTokenizer, 
+        **base_kwargs,
         subfolder="tokenizer",
-        revision=args.revision,
     )
     logger.info("Loaded CLIP tokenizer")
     free_memory()
+    print_memory_usage("after CLIP tokenizer")
 
-    tokenizer_two = T5TokenizerFast.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer_2", 
-        revision=args.revision,
+    tokenizer_two = load_model_safely(
+        T5TokenizerFast,
+        **base_kwargs,
+        subfolder="tokenizer_2",
     )
     logger.info("Loaded T5 tokenizer")
     free_memory()
-    # import correct text encoder classes
+    print_memory_usage("after T5 tokenizer")
+
+    # Load text encoders
     logger.info("Loading text encoders...")
-    try:
-        text_encoder_cls_one = import_model_class_from_model_name_or_path(
-            args.pretrained_model_name_or_path, args.revision
-        )
-        text_encoder_cls_two = import_model_class_from_model_name_or_path(
-            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-        )
-        logger.info("Imported text encoder classes")
-        free_memory()
-        # Load text encoders directly instead of using load_text_encoders helper
-        text_encoder_one = text_encoder_cls_one.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="text_encoder",
-            revision=args.revision,
-            device_map="auto" if args.enable_cpu_offload else None,
-            variant=args.variant,
-        )
-        logger.info("Loaded text encoder one")
-        
-        text_encoder_two = text_encoder_cls_two.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="text_encoder_2",
-            revision=args.revision,
-            variant=args.variant,
-            device_map="auto" if args.enable_cpu_offload else None,
-        )
-        logger.info("Loaded text encoder two")
-        
-    except Exception as e:
-        logger.error(f"Failed to load text encoders: {str(e)}")
-        logger.error(f"Full error: {e.__class__.__name__}: {str(e)}")
-        raise
+    text_encoder_cls_one = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision
+    )
+    text_encoder_cls_two = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+    )
+    logger.info("Imported text encoder classes")
+    free_memory()
+    print_memory_usage("after importing encoder classes")
+
+    text_encoder_one = load_model_safely(
+        text_encoder_cls_one,
+        **base_kwargs,
+        subfolder="text_encoder",
+    )
+    logger.info("Loaded text encoder one")
+    free_memory()
+    print_memory_usage("after text encoder one")
+
+    text_encoder_two = load_model_safely(
+        text_encoder_cls_two,
+        **base_kwargs,
+        subfolder="text_encoder_2",
+    )
+    logger.info("Loaded text encoder two")
+    free_memory()
+    print_memory_usage("after text encoder two")
 
     # Load scheduler and models
-    noise_scheduler = CustomFlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, 
+    noise_scheduler = load_model_safely(
+        CustomFlowMatchEulerDiscreteScheduler,
+        **base_kwargs,
         subfolder="scheduler",
-        device_map="auto" if args.enable_cpu_offload else None,
     )
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+    logger.info("Loaded scheduler")
     free_memory()
+    print_memory_usage("after scheduler")
 
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
+    vae = load_model_safely(
+        AutoencoderKL,
+        **base_kwargs,
         subfolder="vae",
-        revision=args.revision,
-        variant=args.variant,
-        device_map="auto" if args.enable_cpu_offload else None,
     )
+    logger.info("Loaded VAE")
     free_memory()
-    
-    transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, 
-        subfolder="transformer", 
-        revision=args.revision, 
-        variant=args.variant,
-        device_map="auto" if args.enable_cpu_offload else None,
-        torch_dtype=weight_dtype if args.mixed_precision != "no" else torch.float32,
+    print_memory_usage("after VAE")
+
+    transformer = load_model_safely(
+        FluxTransformer2DModel,
+        **base_kwargs,
+        subfolder="transformer",
     )
+    logger.info("Loaded transformer")
     free_memory()
+    print_memory_usage("after transformer")
 
     if args.train_text_encoder_ti:
         # we parse the provided token identifier (or identifiers) into a list. s.t. - "TOK" -> ["TOK"], "TOK,
@@ -1907,53 +2090,60 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
-    if args.optimizer.lower() == "prodigy":
-        try:
-            import prodigyopt
-        except ImportError:
-            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+        if args.optimizer.lower() == "prodigy":
+            try:
+                import prodigyopt
+            except ImportError:
+                raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
 
-        optimizer_class = prodigyopt.Prodigy
+            optimizer_class = prodigyopt.Prodigy
 
-        if args.learning_rate <= 0.1:
-            logger.warning(
-                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+            if args.learning_rate <= 0.1:
+                logger.warning(
+                    "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+                )
+            if not freeze_text_encoder and args.text_encoder_lr:
+                logger.warning(
+                    f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
+                    f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
+                    f"When using prodigy only learning_rate is used as the initial learning rate."
+                )
+                params_to_optimize[te_idx]["lr"] = args.learning_rate
+                params_to_optimize[-1]["lr"] = args.learning_rate
+
+            # Cast all parameters to the correct dtype before creating optimizer
+            for param_group in params_to_optimize:
+                param_group["params"] = [p.to(dtype=weight_dtype) for p in param_group["params"]]
+
+            optimizer = optimizer_class(
+                params_to_optimize,
+                betas=(args.adam_beta1, args.adam_beta2),
+                beta3=args.prodigy_beta3,
+                weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon,
+                decouple=args.prodigy_decouple,
+                use_bias_correction=args.prodigy_use_bias_correction,
+                safeguard_warmup=args.prodigy_safeguard_warmup,
             )
-        if not freeze_text_encoder and args.text_encoder_lr:
-            logger.warning(
-                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
-                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
-                f"When using prodigy only learning_rate is used as the initial learning rate."
-            )
-            # changes the learning rate of text_encoder_parameters to be
-            # --learning_rate
 
-            params_to_optimize[te_idx]["lr"] = args.learning_rate
-            params_to_optimize[-1]["lr"] = args.learning_rate
-        optimizer = optimizer_class(
-            params_to_optimize,
-            betas=(args.adam_beta1, args.adam_beta2),
-            beta3=args.prodigy_beta3,
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-            decouple=args.prodigy_decouple,
-            use_bias_correction=args.prodigy_use_bias_correction,
-            safeguard_warmup=args.prodigy_safeguard_warmup,
-        )
-
-    # Dataset and DataLoaders creation:
+    
+        
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
+        class_prompt=args.class_prompt,
         train_text_encoder_ti=args.train_text_encoder_ti,
         token_abstraction_dict=token_abstraction_dict if args.train_text_encoder_ti else None,
-        class_prompt=args.class_prompt,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
         class_num=args.num_class_images,
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
     )
+    
+     # Replace the datasets check with simple logging
+    logger.info(f"Dataset type: {type(train_dataset)}")
+    logger.info(f"Number of images: {len(train_dataset)}")
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -2076,7 +2266,7 @@ def main(args):
 
     # Prepare everything with our `accelerator`.
     if not freeze_text_encoder:
-        if args.enable_t5_ti:
+        if args.enable_t5_ti: 
             (
                 transformer,
                 text_encoder_one,
@@ -2252,6 +2442,7 @@ def main(args):
                         device=accelerator.device,
                         prompt=prompts,
                     )
+                    
                 # Convert images to latent space
                 if args.cache_latents:
                     model_input = latents_cache[step].sample()
