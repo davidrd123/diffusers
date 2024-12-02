@@ -1953,7 +1953,7 @@ def main(args):
         # Make sure the trainable params are in float32. This is again needed since the base models
         # are in `weight_dtype`. More details:
         # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
-        if args.mixed_precision == "fp16":
+        if args.mixed_precision in ["fp16", "bf16"]:
             models = [transformer_]
             if args.train_text_encoder:
                 models.extend([text_encoder_one_])
@@ -1974,7 +1974,7 @@ def main(args):
         )
 
     # Make sure the trainable params are in float32.
-    if args.mixed_precision == "fp16":
+    if args.mixed_precision in ["fp16", "bf16"]:
         models = [transformer]
         if args.train_text_encoder:
             models.extend([text_encoder_one])
