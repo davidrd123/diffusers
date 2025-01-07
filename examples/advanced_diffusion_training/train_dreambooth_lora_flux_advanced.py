@@ -2013,7 +2013,7 @@ def main(args):
 
     # if --train_text_encoder_ti and train_transformer_frac == 0 where essentially performing textual inversion
     # and not training transformer LoRA layers
-    pure_textual_inversion = args.train_text_encoder_ti and args.train_transformer_frac == 0
+    pure_textual_inversion = args.train_text_encoder_ti and args.train_transformer_frac == 0 
 
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
