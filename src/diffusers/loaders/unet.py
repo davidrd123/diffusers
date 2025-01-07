@@ -343,6 +343,17 @@ class UNet2DConditionLoadersMixin:
                 else:
                     if is_peft_version("<", "0.9.0"):
                         lora_config_kwargs.pop("use_dora")
+
+            if "lora_bias" in lora_config_kwargs:
+                if lora_config_kwargs["lora_bias"]:
+                    if is_peft_version("<=", "0.13.2"):
+                        raise ValueError(
+                            "You need `peft` 0.14.0 at least to use `bias` in LoRAs. Please upgrade your installation of `peft`."
+                        )
+                else:
+                    if is_peft_version("<=", "0.13.2"):
+                        lora_config_kwargs.pop("lora_bias")
+
             lora_config = LoraConfig(**lora_config_kwargs)
 
             # adapter_name
@@ -492,6 +503,9 @@ class UNet2DConditionLoadersMixin:
                     )
                 state_dict = {k: v for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
         else:
+            deprecation_message = "Using the `save_attn_procs()` method has been deprecated and will be removed in a future version. Please use `save_lora_adapter()`."
+            deprecate("save_attn_procs", "0.40.0", deprecation_message)
+
             if not USE_PEFT_BACKEND:
                 raise ValueError("PEFT backend is required for saving LoRAs using the `save_attn_procs()` method.")
 
